@@ -99,29 +99,66 @@ def get_precisions(symbol):
             return qp, tick_prec
     return 3, 4
 
+def round_to_tick(price, tick_prec):
+    """Round price to correct decimal places for Binance"""
+    return round(price, tick_prec)
+
+def place_protect_order(symbol, side, order_type, stop_price, pp, retries=3):
+    """Place SL or TP with retries and full error logging"""
+    for attempt in range(retries):
+        try:
+            ts = int(time.time() * 1000)
+            p  = {
+                "symbol":        symbol,
+                "side":          side,
+                "type":          order_type,
+                "stopPrice":     f"{stop_price:.{pp}f}",
+                "closePosition": "true",
+                "workingType":   "MARK_PRICE",   # required by Binance futures
+                "priceProtect":  "true",          # prevents bad fills
+                "timeInForce":   "GTE_GTC",
+                "timestamp":     ts
+            }
+            p["signature"] = _sign(p)
+            r = requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h())
+            if r.status_code == 200:
+                log.info(f"{order_type} set @ {stop_price:.{pp}f}")
+                return True
+            else:
+                log.error(f"{order_type} attempt {attempt+1} failed: {r.status_code} | {r.text}")
+                time.sleep(1)
+        except Exception as e:
+            log.error(f"{order_type} attempt {attempt+1} exception: {e}")
+            time.sleep(1)
+    log.error(f"FAILED to place {order_type} after {retries} attempts!")
+    return False
+
 def place_order(symbol, side, qty, price, sl, tp2, qp, pp):
     cs  = "BUY"  if side == "SHORT" else "SELL"
     os_ = "SELL" if side == "SHORT" else "BUY"
     qs  = f"{qty:.{qp}f}"
-    ts  = int(time.time() * 1000)
-    p   = {"symbol": symbol, "side": os_, "type": "MARKET", "quantity": qs, "timestamp": ts}
+
+    # Step 1: Market entry
+    ts = int(time.time() * 1000)
+    p  = {"symbol": symbol, "side": os_, "type": "MARKET", "quantity": qs, "timestamp": ts}
     p["signature"] = _sign(p)
-    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
-    log.info(f"ENTRY {side} {qs} @ ~{price:.4f}")
+    r  = requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h())
+    if r.status_code != 200:
+        log.error(f"ENTRY failed: {r.status_code} {r.text}")
+        r.raise_for_status()
+    log.info(f"ENTRY {side} {qs} @ ~{price:.{pp}f}")
+    time.sleep(1)  # wait for position to register on Binance
+
+    # Step 2: Stop Loss with retry
+    sl_rounded = round_to_tick(sl, pp)
+    log.info(f"Placing SL @ {sl_rounded:.{pp}f} (pp={pp})")
+    place_protect_order(symbol, cs, "STOP_MARKET", sl_rounded, pp)
     time.sleep(0.5)
-    ts = int(time.time() * 1000)
-    p  = {"symbol": symbol, "side": cs, "type": "STOP_MARKET",
-          "stopPrice": f"{sl:.{pp}f}", "closePosition": "true", "timeInForce": "GTE_GTC", "timestamp": ts}
-    p["signature"] = _sign(p)
-    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
-    log.info(f"SL @ {sl:.{pp}f}")
-    time.sleep(0.3)
-    ts = int(time.time() * 1000)
-    p  = {"symbol": symbol, "side": cs, "type": "TAKE_PROFIT_MARKET",
-          "stopPrice": f"{tp2:.{pp}f}", "closePosition": "true", "timeInForce": "GTE_GTC", "timestamp": ts}
-    p["signature"] = _sign(p)
-    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
-    log.info(f"TP2 @ {tp2:.{pp}f}")
+
+    # Step 3: Take Profit with retry
+    tp2_rounded = round_to_tick(tp2, pp)
+    log.info(f"Placing TP2 @ {tp2_rounded:.{pp}f} (pp={pp})")
+    place_protect_order(symbol, cs, "TAKE_PROFIT_MARKET", tp2_rounded, pp)
 
 def close_partial(symbol, side, qty, qp):
     cs   = "BUY" if side == "SHORT" else "SELL"
@@ -151,11 +188,7 @@ def move_sl_breakeven(symbol, side, entry, pp):
     time.sleep(0.3)
     # Place new SL at entry price (breakeven)
     cs = "BUY" if side == "SHORT" else "SELL"
-    ts = int(time.time() * 1000)
-    p  = {"symbol": symbol, "side": cs, "type": "STOP_MARKET",
-          "stopPrice": f"{entry:.{pp}f}", "closePosition": "true", "timeInForce": "GTE_GTC", "timestamp": ts}
-    p["signature"] = _sign(p)
-    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
+    place_protect_order(symbol, cs, "STOP_MARKET", round(entry, pp), pp)
     log.info(f"SL moved to BREAKEVEN @ {entry:.{pp}f}")
 
 # ─────────────────────────────────────────
@@ -322,6 +355,23 @@ async def run_bot():
                     try:
                         place_order(symbol, sig, qty, entry, sl, tp2, qp, pp)
                         state["in_trade"] = True; state["partial_done"] = False
+
+                        # Verify SL and TP were actually placed
+                        await asyncio.sleep(2)
+                        ts_check = int(time.time() * 1000)
+                        p_check  = {"symbol": symbol, "timestamp": ts_check}
+                        p_check["signature"] = _sign(p_check)
+                        open_orders = requests.get(f"{BASE_REST}/fapi/v1/openOrders", params=p_check, headers=_h()).json()
+                        has_sl  = any(o.get("type") == "STOP_MARKET"         for o in open_orders)
+                        has_tp  = any(o.get("type") == "TAKE_PROFIT_MARKET"  for o in open_orders)
+                        cs_side = "BUY" if sig == "SHORT" else "SELL"
+                        if not has_sl:
+                            log.warning("SL missing — retrying...")
+                            place_protect_order(symbol, cs_side, "STOP_MARKET", sl, pp)
+                        if not has_tp:
+                            log.warning("TP2 missing — retrying...")
+                            place_protect_order(symbol, cs_side, "TAKE_PROFIT_MARKET", tp2, pp)
+
                         asyncio.create_task(monitor_position(state, symbol, qp, pp))
                     except Exception as e:
                         log.error(f"Order error: {e}")
