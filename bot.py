@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import logging
 import asyncio
 import websockets
@@ -10,252 +9,228 @@ import hmac
 import hashlib
 from collections import deque
 from urllib.parse import urlencode
+from server import run_dashboard_thread
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# CONFIG — edit these if needed
+# CONFIG
 # ─────────────────────────────────────────
-SYMBOL          = "RIVERUSDT"
-LEVERAGE        = 50
-RISK_PCT        = 0.30        # 30% of balance per trade
-SL_PCT          = 0.0075      # 0.75% stop loss
-TP1_PCT         = 0.014       # 1.4% take profit 1 (50% close)
-TP2_PCT         = 0.030       # 3.0% take profit 2 (full close)
-POLL_INTERVAL   = 5           # seconds between PnL checks
-CANDLE_LIMIT    = 220         # candles to keep in memory
+SYMBOL        = "RIVERUSDT"
+LEVERAGE      = 50
+RISK_PCT      = 0.30
+SL_PCT        = 0.0075
+TP1_PCT       = 0.014
+TP2_PCT       = 0.030
+POLL_INTERVAL = 5
+CANDLE_LIMIT  = 500      # fetch 500 candles = ~8hrs history, rock solid EMAs
+EMA_FAST      = 20
+EMA_SLOW      = 50
+STOCH_K       = 7
+STOCH_SMOOTH  = 3
+STOCH_D       = 10
 
-# EMA periods
-EMA_FAST        = 20
-EMA_SLOW        = 50
-
-# Stochastic settings
-STOCH_K         = 7
-STOCH_SMOOTH_K  = 3
-STOCH_D         = 10
-
-# Binance Futures base URLs
-BASE_REST  = "https://fapi.binance.com"
-BASE_WS    = "wss://fstream.binance.com"
-
-# API keys from environment variables (set in Railway dashboard)
+BASE_REST = "https://fapi.binance.com"
+BASE_WS   = "wss://fstream.binance.com"
 API_KEY    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_SECRET", "")
 
 # ─────────────────────────────────────────
-# BINANCE REST HELPERS
+# PRELOAD — fetches last 500 closed candles
+# instantly on every startup via Binance REST
 # ─────────────────────────────────────────
-def _sign(params: dict) -> str:
-    query = urlencode(params)
-    return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+def preload_candles(opens, highs, lows, closes):
+    log.info("Preloading 500 historical candles from Binance...")
+    try:
+        r = requests.get(f"{BASE_REST}/fapi/v1/klines", params={
+            "symbol": SYMBOL, "interval": "1m", "limit": CANDLE_LIMIT
+        })
+        r.raise_for_status()
+        for c in r.json():
+            opens.append(float(c[1]))
+            highs.append(float(c[2]))
+            lows.append(float(c[3]))
+            closes.append(float(c[4]))
+        log.info(f"Preloaded {len(closes)} candles — ready to trade immediately!")
+    except Exception as e:
+        log.error(f"Preload failed: {e} — will build candles live")
 
-def _headers():
+# ─────────────────────────────────────────
+# BINANCE HELPERS
+# ─────────────────────────────────────────
+def _sign(params):
+    q = urlencode(params)
+    return hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+
+def _h():
     return {"X-MBX-APIKEY": API_KEY}
 
-def get_balance() -> float:
+def get_balance():
     ts = int(time.time() * 1000)
-    params = {"timestamp": ts}
-    params["signature"] = _sign(params)
-    r = requests.get(f"{BASE_REST}/fapi/v2/balance", params=params, headers=_headers())
+    p = {"timestamp": ts}
+    p["signature"] = _sign(p)
+    r = requests.get(f"{BASE_REST}/fapi/v2/balance", params=p, headers=_h())
     r.raise_for_status()
-    for asset in r.json():
-        if asset["asset"] == "USDT":
-            return float(asset["availableBalance"])
+    for a in r.json():
+        if a["asset"] == "USDT":
+            return float(a["availableBalance"])
     return 0.0
 
-def get_position() -> dict | None:
+def get_position():
     ts = int(time.time() * 1000)
-    params = {"symbol": SYMBOL, "timestamp": ts}
-    params["signature"] = _sign(params)
-    r = requests.get(f"{BASE_REST}/fapi/v2/positionRisk", params=params, headers=_headers())
+    p = {"symbol": SYMBOL, "timestamp": ts}
+    p["signature"] = _sign(p)
+    r = requests.get(f"{BASE_REST}/fapi/v2/positionRisk", params=p, headers=_h())
     r.raise_for_status()
-    for p in r.json():
-        if p["symbol"] == SYMBOL:
-            amt = float(p["positionAmt"])
+    for pos in r.json():
+        if pos["symbol"] == SYMBOL:
+            amt = float(pos["positionAmt"])
             if amt != 0:
+                entry = float(pos["entryPrice"])
+                pnl   = float(pos["unRealizedProfit"])
                 return {
-                    "side": "SHORT" if amt < 0 else "LONG",
-                    "qty": abs(amt),
-                    "entry": float(p["entryPrice"]),
-                    "pnl": float(p["unRealizedProfit"]),
-                    "pct": float(p["unRealizedProfit"]) / (abs(amt) * float(p["entryPrice"]) / LEVERAGE) * 100
+                    "side":  "SHORT" if amt < 0 else "LONG",
+                    "qty":   abs(amt),
+                    "entry": entry,
+                    "pnl":   pnl,
+                    "pct":   pnl / (abs(amt) * entry / LEVERAGE) * 100
                 }
     return None
 
 def set_leverage():
     ts = int(time.time() * 1000)
-    params = {"symbol": SYMBOL, "leverage": LEVERAGE, "timestamp": ts}
-    params["signature"] = _sign(params)
-    requests.post(f"{BASE_REST}/fapi/v1/leverage", params=params, headers=_headers())
+    p = {"symbol": SYMBOL, "leverage": LEVERAGE, "timestamp": ts}
+    p["signature"] = _sign(p)
+    requests.post(f"{BASE_REST}/fapi/v1/leverage", params=p, headers=_h())
 
-def get_price_precision() -> tuple[int, int]:
+def get_precisions():
     r = requests.get(f"{BASE_REST}/fapi/v1/exchangeInfo")
     for s in r.json()["symbols"]:
         if s["symbol"] == SYMBOL:
-            qty_prec  = s["quantityPrecision"]
-            price_prec = s["pricePrecision"]
-            return qty_prec, price_prec
+            return s["quantityPrecision"], s["pricePrecision"]
     return 3, 4
 
-def place_order(side: str, qty: float, price: float,
-                sl: float, tp1: float, tp2: float,
-                qty_prec: int, price_prec: int):
-    ts = int(time.time() * 1000)
-    close_side = "BUY" if side == "SHORT" else "SELL"
-    order_side  = "SELL" if side == "SHORT" else "BUY"
-    qty_str = f"{qty:.{qty_prec}f}"
+def place_order(side, qty, price, sl, tp2, qp, pp):
+    cs  = "BUY"  if side == "SHORT" else "SELL"
+    os_ = "SELL" if side == "SHORT" else "BUY"
+    qs  = f"{qty:.{qp}f}"
 
     # Market entry
-    params = {
-        "symbol": SYMBOL, "side": order_side, "type": "MARKET",
-        "quantity": qty_str, "timestamp": ts
-    }
-    params["signature"] = _sign(params)
-    r = requests.post(f"{BASE_REST}/fapi/v1/order", params=params, headers=_headers())
-    r.raise_for_status()
-    log.info(f"ENTRY {side} {qty_str} @ ~{price:.4f}")
-
+    ts = int(time.time() * 1000)
+    p = {"symbol": SYMBOL, "side": os_, "type": "MARKET", "quantity": qs, "timestamp": ts}
+    p["signature"] = _sign(p)
+    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
+    log.info(f"ENTRY {side} {qs} @ ~{price:.4f}")
     time.sleep(0.5)
 
     # Stop loss
     ts = int(time.time() * 1000)
-    sl_str = f"{sl:.{price_prec}f}"
-    params = {
-        "symbol": SYMBOL, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": sl_str, "closePosition": "true",
-        "timeInForce": "GTE_GTC", "timestamp": ts
-    }
-    params["signature"] = _sign(params)
-    r = requests.post(f"{BASE_REST}/fapi/v1/order", params=params, headers=_headers())
-    r.raise_for_status()
-    log.info(f"SL set at {sl_str}")
-
-    # TP2 — full close (remaining 50% after TP1 partial)
+    p = {"symbol": SYMBOL, "side": cs, "type": "STOP_MARKET",
+         "stopPrice": f"{sl:.{pp}f}", "closePosition": "true",
+         "timeInForce": "GTE_GTC", "timestamp": ts}
+    p["signature"] = _sign(p)
+    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
+    log.info(f"SL @ {sl:.{pp}f}")
     time.sleep(0.3)
-    ts = int(time.time() * 1000)
-    tp2_str = f"{tp2:.{price_prec}f}"
-    half_qty = f"{qty/2:.{qty_prec}f}"
-    params = {
-        "symbol": SYMBOL, "side": close_side, "type": "TAKE_PROFIT_MARKET",
-        "stopPrice": tp2_str, "closePosition": "true",
-        "timeInForce": "GTE_GTC", "timestamp": ts
-    }
-    params["signature"] = _sign(params)
-    r = requests.post(f"{BASE_REST}/fapi/v1/order", params=params, headers=_headers())
-    r.raise_for_status()
-    log.info(f"TP2 set at {tp2_str}")
 
-def close_partial(side: str, qty: float, qty_prec: int):
-    close_side = "BUY" if side == "SHORT" else "SELL"
-    half = f"{qty/2:.{qty_prec}f}"
+    # TP2 full close
     ts = int(time.time() * 1000)
-    params = {
-        "symbol": SYMBOL, "side": close_side, "type": "MARKET",
-        "quantity": half, "reduceOnly": "true", "timestamp": ts
-    }
-    params["signature"] = _sign(params)
-    r = requests.post(f"{BASE_REST}/fapi/v1/order", params=params, headers=_headers())
-    r.raise_for_status()
+    p = {"symbol": SYMBOL, "side": cs, "type": "TAKE_PROFIT_MARKET",
+         "stopPrice": f"{tp2:.{pp}f}", "closePosition": "true",
+         "timeInForce": "GTE_GTC", "timestamp": ts}
+    p["signature"] = _sign(p)
+    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
+    log.info(f"TP2 @ {tp2:.{pp}f}")
+
+def close_partial(side, qty, qp):
+    cs   = "BUY" if side == "SHORT" else "SELL"
+    half = f"{qty / 2:.{qp}f}"
+    ts   = int(time.time() * 1000)
+    p = {"symbol": SYMBOL, "side": cs, "type": "MARKET",
+         "quantity": half, "reduceOnly": "true", "timestamp": ts}
+    p["signature"] = _sign(p)
+    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
     log.info(f"PARTIAL CLOSE 50% — {half} contracts")
 
-def cancel_sl_and_reset(side: str, entry: float, price_prec: int):
-    # Cancel all open orders
+def move_sl_breakeven(side, entry, pp):
+    # Cancel all existing orders first
     ts = int(time.time() * 1000)
-    params = {"symbol": SYMBOL, "timestamp": ts}
-    params["signature"] = _sign(params)
-    requests.delete(f"{BASE_REST}/fapi/v1/allOpenOrders", params=params, headers=_headers())
-    log.info("Cancelled all open orders")
+    p  = {"symbol": SYMBOL, "timestamp": ts}
+    p["signature"] = _sign(p)
+    requests.delete(f"{BASE_REST}/fapi/v1/allOpenOrders", params=p, headers=_h())
+    log.info("All orders cancelled")
     time.sleep(0.3)
 
-    # Re-set SL to breakeven (entry price)
-    close_side = "BUY" if side == "SHORT" else "SELL"
+    # New SL at entry (breakeven)
+    cs = "BUY" if side == "SHORT" else "SELL"
     ts = int(time.time() * 1000)
-    sl_str = f"{entry:.{price_prec}f}"
-    params = {
-        "symbol": SYMBOL, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": sl_str, "closePosition": "true",
-        "timeInForce": "GTE_GTC", "timestamp": ts
-    }
-    params["signature"] = _sign(params)
-    r = requests.post(f"{BASE_REST}/fapi/v1/order", params=params, headers=_headers())
-    r.raise_for_status()
-    log.info(f"SL moved to BREAKEVEN @ {sl_str}")
+    p  = {"symbol": SYMBOL, "side": cs, "type": "STOP_MARKET",
+          "stopPrice": f"{entry:.{pp}f}", "closePosition": "true",
+          "timeInForce": "GTE_GTC", "timestamp": ts}
+    p["signature"] = _sign(p)
+    requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h()).raise_for_status()
+    log.info(f"SL moved to BREAKEVEN @ {entry:.{pp}f}")
 
 # ─────────────────────────────────────────
-# INDICATOR CALCULATIONS
+# INDICATORS
 # ─────────────────────────────────────────
-def calc_ema(closes: list, period: int) -> float:
-    if len(closes) < period:
+def calc_ema(cl, period):
+    if len(cl) < period:
         return 0.0
-    k = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for price in closes[period:]:
-        ema = price * k + ema * (1 - k)
-    return ema
+    k   = 2 / (period + 1)
+    val = sum(cl[:period]) / period
+    for p in cl[period:]:
+        val = p * k + val * (1 - k)
+    return val
 
-def calc_stoch(highs, lows, closes, k_period, smooth_k, d_period) -> tuple[float, float]:
-    n = len(closes)
-    if n < k_period + smooth_k + d_period:
+def calc_stoch(hi, lo, cl, kp, sk, dp):
+    n = len(cl)
+    if n < kp + sk + dp:
         return 50.0, 50.0
-    raw_k = []
-    for i in range(k_period - 1, n):
-        h = max(highs[i - k_period + 1: i + 1])
-        l = min(lows[i - k_period + 1: i + 1])
-        if h == l:
-            raw_k.append(50.0)
-        else:
-            raw_k.append((closes[i] - l) / (h - l) * 100)
-    # Smooth K
-    smooth = []
-    for i in range(smooth_k - 1, len(raw_k)):
-        smooth.append(sum(raw_k[i - smooth_k + 1: i + 1]) / smooth_k)
-    # D line
-    if len(smooth) < d_period:
-        return smooth[-1] if smooth else 50.0, 50.0
-    d_vals = []
-    for i in range(d_period - 1, len(smooth)):
-        d_vals.append(sum(smooth[i - d_period + 1: i + 1]) / d_period)
-    return smooth[-1], d_vals[-1]
+    rk = []
+    for i in range(kp - 1, n):
+        h = max(hi[i - kp + 1: i + 1])
+        l = min(lo[i - kp + 1: i + 1])
+        rk.append(50.0 if h == l else (cl[i] - l) / (h - l) * 100)
+    sm = [sum(rk[i - sk + 1: i + 1]) / sk for i in range(sk - 1, len(rk))]
+    if len(sm) < dp:
+        return sm[-1] if sm else 50.0, 50.0
+    dv = [sum(sm[i - dp + 1: i + 1]) / dp for i in range(dp - 1, len(sm))]
+    return sm[-1], dv[-1]
 
 # ─────────────────────────────────────────
 # SIGNAL DETECTION
 # ─────────────────────────────────────────
-def check_signal(opens, highs, lows, closes) -> str | None:
+def check_signal(opens, highs, lows, closes):
     if len(closes) < CANDLE_LIMIT:
         return None
 
-    cl = list(closes)
-    hi = list(highs)
-    lo = list(lows)
+    cl  = list(closes)
+    hi  = list(highs)
+    lo  = list(lows)
 
-    ema_fast = calc_ema(cl, EMA_FAST)
-    ema_slow = calc_ema(cl, EMA_SLOW)
-    k, d = calc_stoch(hi, lo, cl, STOCH_K, STOCH_SMOOTH_K, STOCH_D)
-
-    # Previous bar stoch
-    k_prev, d_prev = calc_stoch(hi[:-1], lo[:-1], cl[:-1], STOCH_K, STOCH_SMOOTH_K, STOCH_D)
+    e20   = calc_ema(cl, EMA_FAST)
+    e50   = calc_ema(cl, EMA_SLOW)
+    k, d  = calc_stoch(hi, lo, cl, STOCH_K, STOCH_SMOOTH, STOCH_D)
+    kp, _ = calc_stoch(hi[:-1], lo[:-1], cl[:-1], STOCH_K, STOCH_SMOOTH, STOCH_D)
 
     price = cl[-1]
     high  = hi[-1]
 
-    price_below_emas = price < ema_fast and price < ema_slow
-    ema_rejection    = price < ema_fast and high >= ema_fast * 0.998
-    stoch_cross_down = k < d and k_prev >= d_prev and k_prev > 60
-    stoch_drop       = k > 65 and k < k_prev and d > k
+    below = price < e20 and price < e50
+    rej   = price < e20 and high >= e20 * 0.998
+    cdn   = k < d and kp >= d and kp > 60
+    sdrop = k > 65 and k < kp and d > k
+    above = price > e20 and price > e50
+    cup   = k > d and kp <= d and kp < 30
 
-    price_above_emas = price > ema_fast and price > ema_slow
-    stoch_cross_up   = k > d and k_prev <= d_prev and k_prev < 30
-
-    if (price_below_emas and stoch_cross_down) or (ema_rejection and stoch_drop):
-        log.info(f"SHORT signal | price={price:.4f} EMA20={ema_fast:.4f} K={k:.1f} D={d:.1f}")
+    if (below and cdn) or (rej and sdrop):
+        log.info(f"SHORT signal | price={price:.4f} EMA20={e20:.4f} K={k:.1f} D={d:.1f}")
         return "SHORT"
 
-    if price_above_emas and stoch_cross_up:
-        log.info(f"LONG signal | price={price:.4f} EMA20={ema_fast:.4f} K={k:.1f} D={d:.1f}")
+    if above and cup:
+        log.info(f"LONG signal | price={price:.4f} EMA20={e20:.4f} K={k:.1f} D={d:.1f}")
         return "LONG"
 
     return None
@@ -263,115 +238,103 @@ def check_signal(opens, highs, lows, closes) -> str | None:
 # ─────────────────────────────────────────
 # POSITION MONITOR LOOP
 # ─────────────────────────────────────────
-async def monitor_position(state: dict, qty_prec: int, price_prec: int):
+async def monitor_position(state, qp, pp):
     while state.get("in_trade"):
         await asyncio.sleep(POLL_INTERVAL)
         try:
             pos = get_position()
-            if pos is None:
+            if not pos:
                 log.info("Position closed.")
-                state["in_trade"] = False
+                state["in_trade"]    = False
                 state["partial_done"] = False
                 break
 
-            pct = pos["pct"]
-            log.info(f"PnL: {pct:.1f}% | entry={pos['entry']:.4f} | side={pos['side']}")
+            log.info(f"PnL: {pos['pct']:.1f}% | entry={pos['entry']:.4f} | {pos['side']}")
 
-            # At 50% profit — close half and move SL to breakeven
-            if pct >= 50 and not state.get("partial_done"):
-                log.info("50% profit hit — closing half position")
-                close_partial(pos["side"], pos["qty"], qty_prec)
+            if pos["pct"] >= 50 and not state.get("partial_done"):
+                log.info("50% profit hit — closing half + moving SL to breakeven")
+                close_partial(pos["side"], pos["qty"], qp)
                 await asyncio.sleep(1)
-                cancel_sl_and_reset(pos["side"], pos["entry"], price_prec)
+                move_sl_breakeven(pos["side"], pos["entry"], pp)
                 state["partial_done"] = True
 
         except Exception as e:
             log.error(f"Monitor error: {e}")
 
 # ─────────────────────────────────────────
-# MAIN BOT LOOP — WebSocket
+# MAIN BOT LOOP
 # ─────────────────────────────────────────
 async def run_bot():
     log.info("Starting RIVER bot...")
+    run_dashboard_thread()          # serve dashboard.html on port 8080
+
     set_leverage()
-    qty_prec, price_prec = get_price_precision()
-    log.info(f"Leverage set to {LEVERAGE}x | qty_prec={qty_prec} price_prec={price_prec}")
+    qp, pp = get_precisions()
+    log.info(f"Leverage={LEVERAGE}x | qty_prec={qp} | price_prec={pp}")
 
     opens  = deque(maxlen=CANDLE_LIMIT)
     highs  = deque(maxlen=CANDLE_LIMIT)
     lows   = deque(maxlen=CANDLE_LIMIT)
     closes = deque(maxlen=CANDLE_LIMIT)
 
-    state = {"in_trade": False, "partial_done": False}
+    preload_candles(opens, highs, lows, closes)   # loads 500 candles in ~1 second
 
-    stream = f"{BASE_WS}/ws/{SYMBOL.lower()}@kline_1m"
+    state = {"in_trade": False, "partial_done": False}
 
     while True:
         try:
-            async with websockets.connect(stream) as ws:
-                log.info(f"Connected to {stream}")
+            async with websockets.connect(f"{BASE_WS}/ws/{SYMBOL.lower()}@kline_1m") as ws:
+                log.info("WebSocket connected — monitoring live candles")
                 async for msg in ws:
-                    data = json.loads(msg)
-                    k = data["k"]
-
-                    # Only process closed candles
+                    k = json.loads(msg)["k"]
                     if not k["x"]:
-                        continue
+                        continue   # skip unfinished candles
 
                     opens.append(float(k["o"]))
                     highs.append(float(k["h"]))
                     lows.append(float(k["l"]))
                     closes.append(float(k["c"]))
-
-                    log.info(f"Candle closed | O={k['o']} H={k['h']} L={k['l']} C={k['c']} | bars={len(closes)}")
+                    log.info(f"Candle closed | C={k['c']} | total bars={len(closes)}")
 
                     if state["in_trade"]:
+                        continue   # already in a trade, monitor loop handles it
+
+                    sig = check_signal(opens, highs, lows, closes)
+                    if not sig:
                         continue
 
-                    signal = check_signal(opens, highs, lows, closes)
-                    if signal is None:
-                        continue
-
-                    # Calculate position size
-                    balance = get_balance()
-                    risk_amount = balance * RISK_PCT
+                    # Calculate order params
+                    bal   = get_balance()
                     entry = float(k["c"])
 
-                    if signal == "SHORT":
-                        sl  = round(entry * (1 + SL_PCT), price_prec)
-                        tp1 = round(entry * (1 - TP1_PCT), price_prec)
-                        tp2 = round(entry * (1 - TP2_PCT), price_prec)
+                    if sig == "SHORT":
+                        sl  = round(entry * (1 + SL_PCT),  pp)
+                        tp1 = round(entry * (1 - TP1_PCT), pp)
+                        tp2 = round(entry * (1 - TP2_PCT), pp)
                     else:
-                        sl  = round(entry * (1 - SL_PCT), price_prec)
-                        tp1 = round(entry * (1 + TP1_PCT), price_prec)
-                        tp2 = round(entry * (1 + TP2_PCT), price_prec)
+                        sl  = round(entry * (1 - SL_PCT),  pp)
+                        tp1 = round(entry * (1 + TP1_PCT), pp)
+                        tp2 = round(entry * (1 + TP2_PCT), pp)
 
-                    notional = risk_amount * LEVERAGE
-                    qty = round(notional / entry, qty_prec)
+                    qty = round(bal * RISK_PCT * LEVERAGE / entry, qp)
 
                     if qty <= 0:
-                        log.warning("Qty too small, skipping trade")
+                        log.warning("Position size too small — skipping trade")
                         continue
 
-                    log.info(f"Placing {signal} | balance=${balance:.2f} | notional=${notional:.2f} | qty={qty} | SL={sl} TP1={tp1} TP2={tp2}")
+                    log.info(f"Signal: {sig} | bal=${bal:.2f} | qty={qty} | SL={sl} | TP1={tp1} | TP2={tp2}")
 
                     try:
-                        place_order(signal, qty, entry, sl, tp1, tp2, qty_prec, price_prec)
-                        state["in_trade"] = True
+                        place_order(sig, qty, entry, sl, tp2, qp, pp)
+                        state["in_trade"]    = True
                         state["partial_done"] = False
-
-                        # Start position monitor in background
-                        asyncio.create_task(monitor_position(state, qty_prec, price_prec))
-
+                        asyncio.create_task(monitor_position(state, qp, pp))
                     except Exception as e:
-                        log.error(f"Order failed: {e}")
+                        log.error(f"Order placement failed: {e}")
 
         except Exception as e:
-            log.error(f"WebSocket error: {e} — reconnecting in 5s")
+            log.error(f"WebSocket dropped: {e} — reconnecting in 5s")
             await asyncio.sleep(5)
 
-# ─────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────
 if __name__ == "__main__":
     asyncio.run(run_bot())
