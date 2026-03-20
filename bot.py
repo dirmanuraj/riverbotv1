@@ -146,7 +146,7 @@ def calc_ema(cl, period):
     for p in cl[period:]: v = p * k + v * (1 - k)
     return v
 
-def calc_stoch(hi, lo, cl, kp=7, sk=3, dp=10):
+def calc_stoch(hi, lo, cl, kp=5, sk=3, dp=3):
     n = len(cl)
     if n < kp + sk + dp: return 50.0, 50.0
     rk = []
