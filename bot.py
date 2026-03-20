@@ -87,7 +87,16 @@ def get_precisions(symbol):
     r = requests.get(f"{BASE_REST}/fapi/v1/exchangeInfo")
     for s in r.json()["symbols"]:
         if s["symbol"] == symbol:
-            return s["quantityPrecision"], s["pricePrecision"]
+            qp   = s["quantityPrecision"]
+            tick = "0.0001"
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = f["tickSize"]
+                    break
+            tick_str  = tick.rstrip("0")
+            tick_prec = len(tick_str.split(".")[-1]) if "." in tick_str else 0
+            log.info(f"tick_size={tick} | price_prec={tick_prec}")
+            return qp, tick_prec
     return 3, 4
 
 def place_order(symbol, side, qty, price, sl, tp2, qp, pp):
@@ -125,10 +134,22 @@ def close_partial(symbol, side, qty, qp):
     log.info(f"PARTIAL CLOSE 50% — {half}")
 
 def move_sl_breakeven(symbol, side, entry, pp):
-    ts = int(time.time() * 1000)
-    p  = {"symbol": symbol, "timestamp": ts}; p["signature"] = _sign(p)
-    requests.delete(f"{BASE_REST}/fapi/v1/allOpenOrders", params=p, headers=_h())
+    # Cancel ONLY the stop loss order — leave TP2 untouched
+    try:
+        ts = int(time.time() * 1000)
+        p  = {"symbol": symbol, "timestamp": ts}; p["signature"] = _sign(p)
+        r  = requests.get(f"{BASE_REST}/fapi/v1/openOrders", params=p, headers=_h())
+        for o in r.json():
+            if o.get("type") == "STOP_MARKET":
+                ts2 = int(time.time() * 1000)
+                cp  = {"symbol": symbol, "orderId": o["orderId"], "timestamp": ts2}
+                cp["signature"] = _sign(cp)
+                requests.delete(f"{BASE_REST}/fapi/v1/order", params=cp, headers=_h())
+                log.info(f"Cancelled old SL order {o['orderId']}")
+    except Exception as e:
+        log.error(f"Cancel SL error: {e}")
     time.sleep(0.3)
+    # Place new SL at entry price (breakeven)
     cs = "BUY" if side == "SHORT" else "SELL"
     ts = int(time.time() * 1000)
     p  = {"symbol": symbol, "side": cs, "type": "STOP_MARKET",
@@ -184,20 +205,24 @@ def check_signal(highs, lows, closes, side_mode):
 # POSITION MONITOR
 # ─────────────────────────────────────────
 async def monitor_position(state, symbol, qp, pp):
+    log.info(f"Monitor started for {symbol}")
     while state.get("in_trade"):
         await asyncio.sleep(5)
         try:
             pos = get_position(symbol)
             if not pos:
-                log.info("Position closed.")
-                state["in_trade"] = False; state["partial_done"] = False; break
+                log.info("Position closed — resetting state")
+                state["in_trade"]    = False
+                state["partial_done"] = False
+                break
             log.info(f"PnL: {pos['pct']:.1f}% | entry={pos['entry']:.4f} | {pos['side']}")
-            if pos["pct"] >= 50 and not state.get("partial_done"):
-                log.info("50% profit — closing half + breakeven SL")
+            # Only do partial close + breakeven ONCE
+            if pos["pct"] >= 50 and not state["partial_done"]:
+                log.info("50% profit hit — closing half, moving SL to breakeven")
+                state["partial_done"] = True   # set FIRST to prevent race condition
                 close_partial(symbol, pos["side"], pos["qty"], qp)
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)         # wait for partial to fill
                 move_sl_breakeven(symbol, pos["side"], pos["entry"], pp)
-                state["partial_done"] = True
         except Exception as e:
             log.error(f"Monitor error: {e}")
 
@@ -223,7 +248,15 @@ async def run_bot():
     closes = deque(maxlen=candle_lim)
 
     preload_candles(symbol, opens, highs, lows, closes, candle_lim)
-    state = {"in_trade": False, "partial_done": False}
+
+    # ── On startup: check if a position already exists ──
+    # This prevents re-entering after a Railway restart
+    existing = get_position(symbol)
+    if existing:
+        log.info(f"Existing position found on startup: {existing['side']} {existing['qty']} — resuming monitor")
+        state = {"in_trade": True, "partial_done": False}
+    else:
+        state = {"in_trade": False, "partial_done": False}
     current_symbol = symbol
 
     while True:
