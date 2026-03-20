@@ -104,34 +104,76 @@ def round_to_tick(price, tick_prec):
     return round(price, tick_prec)
 
 def place_protect_order(symbol, side, order_type, stop_price, pp, retries=3):
-    """Place SL or TP with retries and full error logging"""
+    """
+    Binance Futures SL/TP via standard order endpoint using STOP and TAKE_PROFIT
+    with quantity instead of closePosition for compatibility.
+    """
+    # Get current position size to set quantity
+    try:
+        ts  = int(time.time() * 1000)
+        p   = {"symbol": symbol, "timestamp": ts}
+        p["signature"] = _sign(p)
+        r   = requests.get(f"{BASE_REST}/fapi/v2/positionRisk", params=p, headers=_h())
+        qty = 0.0
+        for pos in r.json():
+            if pos["symbol"] == symbol:
+                qty = abs(float(pos["positionAmt"]))
+                break
+    except Exception as e:
+        log.error(f"Could not get position qty: {e}")
+        qty = 0.0
+
+    # Map to correct Binance order types
+    binance_type = "STOP_MARKET" if order_type == "STOP_MARKET" else "TAKE_PROFIT_MARKET"
+
     for attempt in range(retries):
         try:
             ts = int(time.time() * 1000)
             p  = {
                 "symbol":        symbol,
                 "side":          side,
-                "type":          order_type,
+                "type":          binance_type,
                 "stopPrice":     f"{stop_price:.{pp}f}",
                 "closePosition": "true",
-                "workingType":   "MARK_PRICE",   # required by Binance futures
-                "priceProtect":  "true",          # prevents bad fills
-                "timeInForce":   "GTE_GTC",
+                "workingType":   "CONTRACT_PRICE",
                 "timestamp":     ts
             }
             p["signature"] = _sign(p)
+            # Try standard endpoint first
             r = requests.post(f"{BASE_REST}/fapi/v1/order", params=p, headers=_h())
             if r.status_code == 200:
-                log.info(f"{order_type} set @ {stop_price:.{pp}f}")
+                log.info(f"{binance_type} set @ {stop_price:.{pp}f}")
                 return True
+            err = r.json()
+            # If -4120 error: use conditional/order endpoint (new Binance algo API)
+            if err.get("code") == -4120:
+                log.info(f"Switching to conditional/order endpoint for {binance_type}")
+                ts2 = int(time.time() * 1000)
+                strategy = "STOP" if order_type == "STOP_MARKET" else "TAKE_PROFIT"
+                p2 = {
+                    "symbol":       symbol,
+                    "side":         side,
+                    "strategyType": strategy,
+                    "stopPrice":    f"{stop_price:.{pp}f}",
+                    "workingType":  "CONTRACT_PRICE",
+                    "closePosition":"true",
+                    "timestamp":    ts2
+                }
+                p2["signature"] = _sign(p2)
+                r2 = requests.post(f"{BASE_REST}/fapi/v1/conditional/order", params=p2, headers=_h())
+                if r2.status_code == 200:
+                    log.info(f"{strategy} (conditional) set @ {stop_price:.{pp}f}")
+                    return True
+                log.error(f"{strategy} conditional attempt {attempt+1}: {r2.status_code} | {r2.text}")
             else:
-                log.error(f"{order_type} attempt {attempt+1} failed: {r.status_code} | {r.text}")
-                time.sleep(1)
+                log.error(f"{binance_type} attempt {attempt+1}: {r.status_code} | {r.text}")
+            time.sleep(1)
         except Exception as e:
-            log.error(f"{order_type} attempt {attempt+1} exception: {e}")
+            log.error(f"place_protect_order exception: {e}")
             time.sleep(1)
     log.error(f"FAILED to place {order_type} after {retries} attempts!")
     return False
+
 
 def place_order(symbol, side, qty, price, sl, tp2, qp, pp):
     cs  = "BUY"  if side == "SHORT" else "SELL"
